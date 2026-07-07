@@ -1,0 +1,45 @@
+# ── 大文件 / 模型目录 ──
+ModelTrain/models/XVector_half/
+ModelTrain/models/XVector_test/
+ModelTrain/models/XVector/
+ModelTrain/models/XVector_full/
+ModelTrain/RecogizeTrain/data/
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+
+# ── 日志 ──
+*.log
+logs/
+
+# ── 临时输出文件 ──
+train_log.txt
+train_stdout.txt
+train_stderr.txt
+training_log.txt
+err_xv.txt
+model_demo_out.txt
+*_clip.json
+*_clip.txt
+ecapa_result_*.json
+_clip.json
+_ec_clip.json
+_ecapa_clip.json
+_ecapa_clip.txt
+_ecapa_test.txt
+_tex.json
+tex_vad_cluster.png
+
+# ── 评估结果 JSON（可复现） ──
+evaluation/*_results*.json
+evaluation/blind_predictions.json
+evaluation/blind_216.json
+evaluation/eval_results.json
+evaluation/quick_test_results.json
+evaluation/medium_test_results.json
+
+# ── 临时调试文件 ──
+evaluation/_test_output.txt
+evaluation/t.txt
