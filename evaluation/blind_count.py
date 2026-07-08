@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-纯盲说话人计数 v2 — 两阶段架构
-Tier1 筛选器 → Tier2 谱聚类(轻量) / Tier3 DBSCAN密度计数(重量)
-全程不碰 RTTM 标签
+纯盲说话人计数 v3 — 在线追踪法 (Online Tracking)
+模拟人耳机制：按时间顺序逐段判断 "新人物 or 已知人物"
+全程不碰 RTTM 标签，不预设 k
 """
 import os, sys, time, warnings
 warnings.filterwarnings('ignore')
@@ -14,28 +14,69 @@ sys.path.insert(0, PROJECT)
 import numpy as np
 import torch
 import json
+import shutil
+
+# torch 2.6 兼容: 强制 weights_only=False
+_t_load = torch.load
+torch.load = lambda *a, **kw: _t_load(*a, **{**kw, 'weights_only': False})
+
+# Windows 符号链接修复: 强制用 copy 代替 symlink
+import pathlib
+if hasattr(pathlib.WindowsPath, 'symlink_to'):
+    _orig_symlink = pathlib.WindowsPath.symlink_to
+    def _copy_instead_of_symlink(self, target, target_is_directory=False):
+        target_path = pathlib.Path(target)
+        if target_path.is_file():
+            shutil.copy2(str(target_path), str(self))
+        elif target_path.is_dir():
+            shutil.copytree(str(target_path), str(self), dirs_exist_ok=True)
+    pathlib.WindowsPath.symlink_to = _copy_instead_of_symlink
 
 AUDIO = os.path.join(BASE, 'voxconverse_dev_wav', 'audio')
 SR_TARGET = 16000
 VAD_FRAME_MS = 25
 VAD_HOP_MS = 10
 
-# ---- ECAPA ----
-os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+# ---- 在线追踪参数 ----
+THRESHOLD_MATCH = 0.55      # 余弦相似度 > 此值 → 同一人 (CAM++ 512维, 网格搜索最优)
+EMA_ALPHA = 0.25            # 声纹档案更新权重 (越小越保守)
+MIN_CONFIRM = 4             # 候选说话人至少被确认 N 次才成为正式档案
+MIN_SEG_DUR = 3.5           # 最短有效语音段 (秒)，过短则合并或丢弃
+CHUNK_DUR = 3.0             # 每段提取嵌入的窗口长度 (秒)
+DUAL_PASS = False           # True=双向追踪 False=仅正向
 
-_classifier = None
-def get_classifier():
-    global _classifier
-    if _classifier is None:
-        from speechbrain.inference.speaker import EncoderClassifier
-        print("[ECAPA] 加载模型...")
+# ---- CAM++ VoxCeleb 512维嵌入 (FunASR 架构 + ModelScope 权重) ----
+_embedding_model = None
+_FBANK_DIM = 80
+_EMB_SIZE = 512
+_CKPT_PATH = r'C:\Users\hp\.cache\modelscope\models\damo--speech_campplus_sv_en_voxceleb_16k\snapshots\master\campplus_voxceleb.bin'
+
+def get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        from funasr.models.campplus.model import CAMPPlus
+        print("[Embedding] 加载 VoxCeleb CAM++ (512维)...")
+        _embedding_model = CAMPPlus(embedding_size=_EMB_SIZE)
+        sd = torch.load(_CKPT_PATH, map_location='cpu')
+        _embedding_model.load_state_dict(sd, strict=True)
+        _embedding_model.eval()
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        _classifier = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": device}
-        )
-        print("[ECAPA] 加载完成")
-    return _classifier
+        _embedding_model = _embedding_model.to(device)
+        print(f"[Embedding] 加载完成 (device={device})")
+    return _embedding_model
+
+
+def extract_one_embedding(chunk, sr, model):
+    """从一段音频提取 CAM++ 嵌入向量 (512-dim)"""
+    from funasr.models.campplus.utils import extract_feature
+    from funasr.utils.load_utils import load_audio_text_image_video
+    device = next(model.parameters()).device
+    audio_list = load_audio_text_image_video([chunk], fs=16000, audio_fs=sr, data_type='sound')
+    feats, _, _ = extract_feature(audio_list)
+    feats = feats.to(device=device).to(torch.float32)
+    with torch.no_grad():
+        emb = model(feats)
+    return emb.cpu().numpy().squeeze()
 
 
 def energy_vad(y, sr, percentile=15):
@@ -83,204 +124,242 @@ def energy_vad(y, sr, percentile=15):
     return segments
 
 
-def extract_embeddings_dense(y, sr, classifier, chunk_dur=1.5, overlap=0.5):
-    """密集采样：更短段长、更大重叠 → 更多段，用于多人场景"""
-    step = chunk_dur * (1 - overlap)
-    chunk_samps = int(chunk_dur * sr)
-    step_samps = int(step * sr)
-
-    embeddings = []
-    for start in range(0, max(1, len(y) - chunk_samps + 1), max(1, step_samps)):
-        end = min(start + chunk_samps, len(y))
-        chunk = y[start:end]
-        if len(chunk) < sr * 0.5:
-            continue
-        target_len = int(np.ceil(len(chunk) / sr) * sr)
-        chunk = np.pad(chunk, (0, max(0, target_len - len(chunk))))
-        with torch.no_grad():
-            emb = classifier.encode_batch(
-                torch.from_numpy(chunk).unsqueeze(0)
-            ).squeeze().cpu().numpy()
-        embeddings.append(emb)
-
-    if len(embeddings) == 0:
-        return np.zeros((0, 192))
-    return np.stack(embeddings)
+def merge_short_segments(voice_segs, max_gap=1.0):
+    """合并相邻短段：间隔 < max_gap 且合并后不超长则合并，丢弃过短孤立段"""
+    if len(voice_segs) == 0:
+        return []
+    merged = []
+    cur_start, cur_end = voice_segs[0]
+    for s, e in voice_segs[1:]:
+        if s - cur_end < max_gap:
+            cur_end = e
+        else:
+            if cur_end - cur_start >= MIN_SEG_DUR:
+                merged.append((cur_start, cur_end))
+            cur_start, cur_end = s, e
+    if cur_end - cur_start >= MIN_SEG_DUR:
+        merged.append((cur_start, cur_end))
+    return merged
 
 
-def extract_embeddings_sparse(y, sr, classifier, chunk_dur=3.0, overlap=0.25):
-    """稀疏采样：更长的段、更少重叠 → 嵌入更稳定，用于少人场景"""
-    step = chunk_dur * (1 - overlap)
-    chunk_samps = int(chunk_dur * sr)
-    step_samps = int(step * sr)
-
-    embeddings = []
-    for start in range(0, max(1, len(y) - chunk_samps + 1), max(1, step_samps)):
-        end = min(start + chunk_samps, len(y))
-        chunk = y[start:end]
-        if len(chunk) < sr * 0.5:
-            continue
-        target_len = int(np.ceil(len(chunk) / sr) * sr)
-        chunk = np.pad(chunk, (0, max(0, target_len - len(chunk))))
-        with torch.no_grad():
-            emb = classifier.encode_batch(
-                torch.from_numpy(chunk).unsqueeze(0)
-            ).squeeze().cpu().numpy()
-        embeddings.append(emb)
-
-    if len(embeddings) == 0:
-        return np.zeros((0, 192))
-    return np.stack(embeddings)
-
-
-# ===== Tier 1: 筛选器 =====
-
-def screen_light_or_heavy(embeddings, dur):
+def extract_timeline_embeddings(y, sr, voice_segs, model):
     """
-    快速判断是轻量级(≤4人)还是重量级(5+人)
-    使用嵌入多样性(平均两两距离) + 段数 + 时长 综合判断
-    返回: 'light' 或 'heavy'
+    按时间顺序从每个语音段提取嵌入
+    段长 2.5-8s: 取段中心 CHUNK_DUR=3s 窗口
+    段长 >8s:    滑动 3s 窗口切多个嵌入
+    返回: [(time_mid, embedding), ...]
     """
-    N = len(embeddings)
-    if N < 5:
-        return 'light'
+    results = []
 
-    # 归一化
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    X = embeddings / norms
+    for seg_start, seg_end in voice_segs:
+        seg_dur = seg_end - seg_start
 
-    # 嵌入多样性: 随机抽 min(N, 50) 个段计算平均成对余弦距离
-    n_sample = min(N, 50)
-    idx = np.random.choice(N, n_sample, replace=False)
-    X_sample = X[idx]
-    S_sample = X_sample @ X_sample.T
-    # 平均成对距离 = 1 - 平均相似度 (去掉对角线)
-    mean_sim = (np.sum(S_sample) - n_sample) / (n_sample * (n_sample - 1))
-    diversity = 1 - mean_sim
+        if seg_dur <= 8.0:
+            # 取段中心附近 3s 窗口
+            center = (seg_start + seg_end) / 2
+            half = CHUNK_DUR / 2
+            chunk_start = max(seg_start, center - half)
+            chunk_end = min(seg_end, center + half)
+            s = int(chunk_start * sr)
+            e = int(chunk_end * sr)
+            chunk = y[s:e]
+            emb = extract_one_embedding(chunk, sr, model)
+            results.append((center, emb))
 
-    # 段密度: 每秒平均语音段数
-    seg_density = N / max(dur, 1)
+        else:
+            # 长段: 滑动窗口切多个 3s 子段
+            step_s = 2.0
+            t = seg_start
+            while t + CHUNK_DUR <= seg_end:
+                s = int(t * sr)
+                e = int((t + CHUNK_DUR) * sr)
+                chunk = y[s:e]
+                emb = extract_one_embedding(chunk, sr, model)
+                results.append((t + CHUNK_DUR / 2, emb))
+                t += step_s
 
-    # 综合评分
-    score = diversity * 5 + seg_density * 2 + min(dur / 300, 1)
-
-    if score > 2.5:
-        return 'heavy'
-    return 'light'
+    return results
 
 
-# ===== Tier 2: 谱聚类 (轻量) =====
+# ===== 核心：在线追踪算法 =====
 
-def count_spectral(embeddings):
-    """谱聚类 + 轮廓系数，用于 1-4 人精确计数"""
-    from sklearn.cluster import SpectralClustering
-    from sklearn.metrics import silhouette_score
+def online_track(timeline_embeddings, threshold=None, ema=None, min_confirm=None):
+    """
+    在线追踪法 — 模拟人耳逐段聆听机制
+    
+    参数可覆盖模块级默认值 (用于 ablation 实验)
+    """
+    if threshold is None: threshold = THRESHOLD_MATCH
+    if ema is None: ema = EMA_ALPHA
+    if min_confirm is None: min_confirm = MIN_CONFIRM
 
-    N = len(embeddings)
-    if N < 3:
-        return 1
+    profiles = []       # [(embedding, count), ...] 已确认的说话人档案
+    candidates = []     # [(embedding, count), ...] 候选说话人 (待确认)
+    trace = []          # 调试日志
 
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    X = embeddings / norms
-    S = X @ X.T
+    for seg_idx, (t_mid, emb_raw) in enumerate(timeline_embeddings):
+        emb = emb_raw / (np.linalg.norm(emb_raw) + 1e-8)
 
-    mean_sim = (np.sum(S) - N) / (N * (N - 1))
-    if mean_sim > 0.80:
-        return 1
+        # ---- 第一步: 和已确认档案比对 ----
+        matched = False
+        if profiles:
+            sims = [np.dot(emb, p[0]) for p in profiles]
+            max_sim = max(sims)
+            best_idx = int(np.argmax(sims))
 
-    max_k = min(10, N // 3, N - 1)
-    if max_k < 2:
-        return 1
+            if max_sim > threshold:
+                old_emb, cnt = profiles[best_idx]
+                new_emb = ema * emb + (1 - ema) * old_emb
+                new_emb = new_emb / (np.linalg.norm(new_emb) + 1e-8)
+                profiles[best_idx] = (new_emb, cnt + 1)
+                trace.append(f"  seg{seg_idx} t={t_mid:.1f}s → 档案{best_idx} (sim={max_sim:.3f})")
+                matched = True
 
-    scores = []
-    for k in range(2, max_k + 1):
-        try:
-            sc = SpectralClustering(n_clusters=k, affinity='precomputed',
-                                    random_state=42, assign_labels='kmeans',
-                                    n_init=10)
-            labels = sc.fit_predict(np.clip(S, 0, 1))
-            if len(set(labels)) < 2:
+        if matched:
+            continue
+
+        # ---- 第二步: 和候选档案比对 ----
+        matched_candidate = False
+        if candidates:
+            sims_c = [np.dot(emb, c[0]) for c in candidates]
+            max_sim_c = max(sims_c)
+            best_ci = int(np.argmax(sims_c))
+
+            if max_sim_c > threshold:
+                old_emb, cnt = candidates[best_ci]
+                new_emb = ema * emb + (1 - ema) * old_emb
+                new_emb = new_emb / (np.linalg.norm(new_emb) + 1e-8)
+                new_cnt = cnt + 1
+                trace.append(f"  seg{seg_idx} t={t_mid:.1f}s → 候选{best_ci} "
+                             f"(sim={max_sim_c:.3f} cnt→{new_cnt})")
+
+                if new_cnt >= min_confirm:
+                    profiles.append((new_emb, new_cnt))
+                    candidates.pop(best_ci)
+                    trace.append(f"    ↑ 候选升级为档案{len(profiles)-1}")
+                else:
+                    candidates[best_ci] = (new_emb, new_cnt)
+                matched_candidate = True
+
+        if matched_candidate:
+            continue
+
+        # ---- 第三步: 全新声音 → 创建候选 ----
+        candidates.append((emb, 1))
+        trace.append(f"  seg{seg_idx} t={t_mid:.1f}s → 新候选{len(candidates)-1}")
+
+    # ---- 统计人数 ----
+    n_confirmed = len(profiles)
+
+    # 统计"几乎确认"的候选
+    n_strong_candidates = sum(1 for _, cnt in candidates if cnt >= max(1, min_confirm - 1))
+
+    if n_confirmed == 0:
+        return max(1, len(candidates)), trace
+
+    result = n_confirmed + n_strong_candidates
+    return max(1, result), trace
+
+
+def online_track_dual_pass(timeline_embeddings, threshold=None, ema=None, min_confirm=None):
+    """
+    双向在线追踪 — 正向+反向各扫一遍，合并去重
+    解决正向扫描时后出现但声纹相似的人被 EMA 吞掉的问题
+    """
+    if threshold is None: threshold = THRESHOLD_MATCH
+    if ema is None: ema = EMA_ALPHA
+    if min_confirm is None: min_confirm = MIN_CONFIRM
+
+    if len(timeline_embeddings) < 2:
+        return 1, []
+
+    # 正向扫描
+    def run_pass(timeline):
+        """返回: (确认档案列表[(emb, cnt)], 候选列表[(emb, cnt)], trace)"""
+        profiles = []
+        candidates = []
+        trace = []
+        for seg_idx, (t_mid, emb_raw) in enumerate(timeline):
+            emb = emb_raw / (np.linalg.norm(emb_raw) + 1e-8)
+            matched = False
+            if profiles:
+                sims = [np.dot(emb, p[0]) for p in profiles]
+                max_sim = max(sims)
+                if max_sim > threshold:
+                    old_emb, cnt = profiles[int(np.argmax(sims))]
+                    new_emb = ema * emb + (1 - ema) * old_emb
+                    new_emb = new_emb / (np.linalg.norm(new_emb) + 1e-8)
+                    profiles[int(np.argmax(sims))] = (new_emb, cnt + 1)
+                    matched = True
+            if matched:
                 continue
-            score = silhouette_score(X, labels)
-            scores.append((k, score))
-        except Exception:
-            continue
+            matched_c = False
+            if candidates:
+                sims_c = [np.dot(emb, c[0]) for c in candidates]
+                max_sim_c = max(sims_c)
+                if max_sim_c > threshold:
+                    old_emb, cnt = candidates[int(np.argmax(sims_c))]
+                    new_emb = ema * emb + (1 - ema) * old_emb
+                    new_emb = new_emb / (np.linalg.norm(new_emb) + 1e-8)
+                    new_cnt = cnt + 1
+                    if new_cnt >= min_confirm:
+                        profiles.append((new_emb, new_cnt))
+                        candidates.pop(int(np.argmax(sims_c)))
+                    else:
+                        candidates[int(np.argmax(sims_c))] = (new_emb, new_cnt)
+                    matched_c = True
+            if matched_c:
+                continue
+            candidates.append((emb, 1))
+        return profiles, candidates, trace
 
-    if not scores:
-        return 1
+    profiles_fwd, cands_fwd, trace_fwd = run_pass(timeline_embeddings)
+    profiles_rev, cands_rev, trace_rev = run_pass(list(reversed(timeline_embeddings)))
 
-    best_k, best_score = max(scores, key=lambda x: x[1])
-    if best_score < 0.08:
-        return 1
-    return best_k
+    all_trace = trace_fwd + ["--- 反向扫描 ---"] + trace_rev
 
+    # 合并: 反向档案中与正向不重复的，加入最终结果
+    merged_profiles = list(profiles_fwd)
+    merge_threshold = threshold + 0.05  # 去重阈值稍高，避免把同一个人当两个
 
-# ===== Tier 3: DBSCAN 密度计数 (重量) =====
+    for rev_emb, rev_cnt in profiles_rev:
+        is_new = True
+        for fwd_emb, _ in merged_profiles:
+            sim = np.dot(rev_emb, fwd_emb)
+            if sim > merge_threshold:
+                is_new = False
+                break
+        if is_new:
+            merged_profiles.append((rev_emb, rev_cnt))
 
-def count_dbscan(embeddings):
-    """
-    DBSCAN 密度峰值计数 — 不预设 k，让数据自己形成簇
-    自动选择 eps 参数 (基于 k-距离图拐点)
-    返回: 预测说话人数
-    """
-    from sklearn.neighbors import NearestNeighbors
-    from sklearn.cluster import DBSCAN
+    # 候选也类似处理
+    all_cand_embs = [(e, c) for e, c in cands_fwd]
+    for rev_emb, rev_cnt in cands_rev:
+        # 检查是否与已确认档案重复
+        dup = False
+        for fwd_emb, _ in merged_profiles:
+            if np.dot(rev_emb, fwd_emb) > merge_threshold:
+                dup = True; break
+        if not dup:
+            for ce, _ in all_cand_embs:
+                if np.dot(rev_emb, ce) > merge_threshold:
+                    dup = True; break
+        if not dup:
+            all_cand_embs.append((rev_emb, rev_cnt))
 
-    N = len(embeddings)
-    if N < 5:
-        return 1
+    n_confirmed = len(merged_profiles)
+    n_strong = sum(1 for _, cnt in all_cand_embs if cnt >= max(1, min_confirm - 1))
 
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    X = embeddings / norms
+    if n_confirmed == 0:
+        return max(1, len(all_cand_embs)), all_trace
 
-    # 余弦距离 = 1 - 余弦相似度
-    # 计算每个点到第 k 近邻的距离，用于自动选择 eps
-    k_neighbors = min(10, N // 5)
-    if k_neighbors < 2:
-        return 1
-
-    nbrs = NearestNeighbors(n_neighbors=k_neighbors, metric='cosine')
-    nbrs.fit(X)
-    distances, _ = nbrs.kneighbors(X)
-    k_dist = np.sort(distances[:, -1])  # 第k近邻距离，排序
-
-    # 找拐点：k-距离曲线最大曲率处
-    if len(k_dist) < 5:
-        return 1
-
-    # 二阶差分找曲率最大点
-    d2 = np.diff(k_dist, 2)
-    if len(d2) == 0:
-        eps = np.median(k_dist)
-    else:
-        knee = np.argmax(np.abs(d2)) + 1
-        eps = k_dist[min(knee, len(k_dist) - 1)]
-
-    # 防止 eps 过小或过大
-    eps = max(0.05, min(eps, 0.5))
-
-    # DBSCAN 聚类
-    min_samples = max(3, N // 30)
-    db = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine')
-    labels = db.fit_predict(X)
-
-    # 统计有效簇数 (排除噪声标签 -1)
-    unique_clusters = set(labels) - {-1}
-    n_clusters = len(unique_clusters)
-
-    if n_clusters == 0:
-        return 1
-
-    return n_clusters
+    return max(1, n_confirmed + n_strong), all_trace
 
 
 # ===== 主入口 =====
 
-def count_speakers(audio_path, classifier):
-    """纯盲推断说话人数"""
+def count_speakers(audio_path, model, verbose=False, **track_kwargs):
+    """纯盲推断说话人数 — 在线追踪法"""
     import soundfile as sf
     from scipy.signal import resample as scipy_resample
 
@@ -294,60 +373,81 @@ def count_speakers(audio_path, classifier):
     sr = SR_TARGET
     dur = len(y) / sr
 
-    # VAD
-    voice_segs = energy_vad(y, sr)
+    # VAD + 合并短段
+    raw_segs = energy_vad(y, sr)
+    voice_segs = merge_short_segments(raw_segs)
     if len(voice_segs) == 0:
-        return 1, dur, 0, 'none'
+        return 1, dur, 0, []
 
-    voice_signal = np.concatenate([
-        y[int(s*sr):int(e*sr)] for s, e in voice_segs
-    ])
+    # 按时间顺序提取嵌入
+    timeline = extract_timeline_embeddings(y, sr, voice_segs, model)
+    n_segs = len(timeline)
+    if n_segs < 2:
+        return 1, dur, n_segs, []
 
-    # Tier 1: 快速筛选 (稀疏采样 ~30段)
-    emb_quick = extract_embeddings_sparse(voice_signal, sr, classifier,
-                                          chunk_dur=3.0, overlap=0.5)
-    n_segs = len(emb_quick)
-    if n_segs < 3:
-        return 1, dur, n_segs, 'tiny'
+    # 在线追踪 (正向 / 双向)
+    if DUAL_PASS:
+        k, trace = online_track_dual_pass(timeline, **track_kwargs)
+    else:
+        k, trace = online_track(timeline, **track_kwargs)
 
-    tier = screen_light_or_heavy(emb_quick, dur)
+    if verbose:
+        for line in trace:
+            print(line)
 
-    k = count_spectral(emb_quick)
-    return k, dur, n_segs, 'spectral'
+    return k, dur, n_segs, trace
+
+
+# ---- 25文件快速测试集 ----
+TEST_25 = ['bkwns','abjxc','syiwe','qppll','cobal','oenox','bwzyf','jiqvr','jyirt',
+           'hiyis','plbbw','vysqj','sikkm','wjhgf','lknjp','mevkw','kctgl','zfkap',
+           'iqtde','xiglo','jsmbi','qydmg','akthc','exymw','kbkon']
+MODE_25_ONLY = False  # True=只测25条  False=全216条
 
 
 def main():
     import glob
-    wav_files = sorted(glob.glob(os.path.join(AUDIO, '*.wav')))
+    if MODE_25_ONLY:
+        wav_files = [os.path.join(AUDIO, f + '.wav') for f in TEST_25
+                     if os.path.exists(os.path.join(AUDIO, f + '.wav'))]
+        out_name = 'blind_online_25.json'
+    else:
+        wav_files = sorted(glob.glob(os.path.join(AUDIO, '*.wav')))
+        out_name = 'blind_online_track.json'
     total = len(wav_files)
 
+    mode_str = "双向追踪" if DUAL_PASS else "正向追踪"
     print("=" * 60)
-    print(f"  纯盲说话人计数 — 谱聚类+轮廓系数 (全{total}条)")
+    print(f"  纯盲说话人计数 — 在线追踪法 {mode_str} ({total}条)")
+    print(f"  阈值: match>{THRESHOLD_MATCH:.2f}  min确认={MIN_CONFIRM}  EMA={EMA_ALPHA}")
     print("=" * 60)
 
-    classifier = get_classifier()
+    model = get_embedding_model()
 
     predictions = {}
-    out_path = os.path.join(PROJECT, 'evaluation', 'blind_216.json')
+    out_path = os.path.join(PROJECT, 'evaluation', out_name)
+
     for i, wav in enumerate(wav_files):
         fid = os.path.splitext(os.path.basename(wav))[0]
 
         t0 = time.time()
-        k, dur, n_segs, method = count_speakers(wav, classifier)
+        k, dur, n_segs, trace = count_speakers(wav, model, verbose=False)
         elapsed = time.time() - t0
 
+        n_profiles = len([l for l in trace if '档案' in l and '↑' not in l])
+        n_cands = len([l for l in trace if '新候选' in l])
+
         print(f"  [{i+1:>3}/{total}] {fid}  dur={dur:5.0f}s  "
-              f"预测={k:>2}人  segs={n_segs:>3}  {elapsed:4.0f}s")
+              f"预测={k:>2}人  segs={n_segs:>3}  档案={n_profiles}  候选={n_cands}  {elapsed:4.0f}s")
         predictions[fid] = k
 
-        # 每10条保存一次
         if (i + 1) % 10 == 0:
             with open(out_path, 'w') as f:
                 json.dump(predictions, f, indent=2, ensure_ascii=False)
 
     with open(out_path, 'w') as f:
         json.dump(predictions, f, indent=2, ensure_ascii=False)
-    print(f"\n预测结果已保存到 evaluation/blind_216.json")
+    print(f"\n预测结果已保存到 evaluation/{out_name}")
 
 
 if __name__ == '__main__':
